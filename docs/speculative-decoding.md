@@ -146,6 +146,32 @@ the accepted updates in their original order. Test batch rows independently:
 an incorrect stride in an intermediate-state kernel can write beyond its output
 allocation even when batch-one tests pass.
 
+## Official checkpoint support
+
+Original Hugging Face checkpoints use the same `--draft-model` entry point as
+converted MLX weights. Format support does not imply that a full-size target
+fits in local memory; large targets can be converted and quantized separately.
+
+| Checkpoint format | Handling |
+| --- | --- |
+| Red Hat `speculators_model_type: dspark` | Nested backbone config, auxiliary hidden-state taps, causal sliding layers, optional reduced vocabulary and serialized output head |
+| OpenBMB `MiniCPM5-2B-DSpark` | Flat `Qwen3DSparkModel` config and Llama target hidden-state capture |
+
+The Red Hat format covers the published DSpark checkpoints for Qwen3-4B,
+Qwen3.6-35B-A3B, Qwen3.8-27B, Gemma-4-31B-it, Mistral-Small-4-119B-2603,
+GLM-5.2, GLM-5.3, GLM-5.3-Flash, Kimi-K3 and
+NVIDIA-Nemotron-3.5-Super-VL-120B-A12B. Reduced-vocabulary drafters map each
+sample back to a target token before using it in the next Markov step.
+
+Kimi K3 records both its convolution and recurrent state during verification.
+Records are retained only for the active block, prioritizing correct rollback
+over verification throughput.
+
+Low-precision block and single-token matrix operations can round near-tied
+logits differently. When diagnosing greedy differences, compare the same
+prefix and logits in FP32 as well as the checkpoint dtype; a BF16 text mismatch
+alone does not establish a cache rollback error.
+
 ## Runtime block sizes
 
 GLM-5-Next starts at its native MTP depth and can extend to a three-token block
