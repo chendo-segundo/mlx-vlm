@@ -157,6 +157,7 @@ fits in local memory; large targets can be converted and quantized separately.
 | Red Hat `speculators_model_type: dspark` | Nested backbone config, auxiliary hidden-state taps, causal sliding layers, optional reduced vocabulary and serialized output head |
 | OpenBMB `MiniCPM5-2B-DSpark` | Flat `Qwen3DSparkModel` config and Llama target hidden-state capture |
 | JetBrains `Mellum2.1-12B-A2.5B-Thinking-MTP` | Native `mtp.*` extraction, ordinary RMSNorm weights, post-normalization target features and a sliding-attention prediction layer |
+| DeepSeek `DeepSeek-V4.1-Flash` | Native DSpark stages, FP8/FP4 weights, shifted hyper-connections, pre-layer feature taps and transactional compression/Engram caches |
 | Qwen `qwen3_5_text` / `qwen3_5_moe_text` | Native Qwen MTP extraction, including text-only Qwen3.8 checkpoints |
 
 The Red Hat format covers the published DSpark checkpoints for Qwen3-4B,
@@ -168,9 +169,12 @@ sample back to a target token before using it in the next Markov step.
 Checkpoint metadata alone is insufficient: Qwen3-Coder-Next does not publish
 MTP tensors. A native head cannot be extracted from that checkpoint.
 
-Kimi K3 records both its convolution and recurrent state during verification.
-Records are retained only for the active block, prioritizing correct rollback
-over verification throughput.
+DeepSeek V4.1 records ordinary single-token cache transitions during verification.
+Rejecting a proposal restores the attention window, compressed KV, indexer,
+cross-layer handoffs and Engram history together. Records are retained only for
+the active verification block. Kimi K3 similarly records both its convolution
+and recurrent state. These paths prioritize correct rollback over verification
+throughput.
 
 Low-precision block and single-token matrix operations can round near-tied
 logits differently. When diagnosing greedy differences, compare the same

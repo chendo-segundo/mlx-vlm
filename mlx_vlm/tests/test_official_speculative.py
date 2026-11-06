@@ -1,5 +1,6 @@
 """Official checkpoint layouts and target cache contracts, without downloads."""
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -146,7 +147,19 @@ def target_model(family):
         head_dim=8,
         rope_theta=10000.0,
     )
-    if family == "mistral4":
+    if family == "deepseek_v41":
+        raw = deepcopy(model_case(family)["config"])
+        raw.update(
+            dspark_target_layer_ids=[1, 2, 3],
+            num_nextn_predict_layers=2,
+            dspark_n_routed_experts=2,
+            dspark_num_experts_per_tok=1,
+            dspark_noise_token_id=63,
+            dspark_markov_rank=8,
+            dspark_block_size=3,
+        )
+        cfg = module(f"models.{family}.config").ModelConfig.from_dict(raw)
+    elif family == "mistral4":
         raw = model_case("TestModels.mistral4")["config"]["text_config"]
         cfg = module("models.mistral3.config").TextConfig.from_dict(raw)
         family = "mistral3"
@@ -182,11 +195,19 @@ def target_model(family):
     else:
         cfg = module(f"models.{family}.config").ModelConfig.from_dict(basic)
     model = module(f"models.{family}.language").LanguageModel(cfg)
+    if family == "deepseek_v41":
+        from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+
+        model.engram_hash = NgramHashState(
+            cfg, model.layout, token_map=[i % 7 for i in range(cfg.vocab_size)]
+        )
     model.eval()
     return model
 
 
-@pytest.mark.parametrize("family", ["qwen3", "llama", "mistral4", "kimi_k3"])
+@pytest.mark.parametrize(
+    "family", ["qwen3", "llama", "mistral4", "kimi_k3", "deepseek_v41"]
+)
 @pytest.mark.parametrize("keep", [0, 1, 3])
 def test_target_hidden_capture_and_rejected_prefix(family, keep):
     mx.random.seed(5)
@@ -227,33 +248,79 @@ def test_target_hidden_capture_and_rejected_prefix(family, keep):
     )
 
 
+@pytest.mark.parametrize("abort", [False, True])
+def test_deepseek_v41_batch_cache_restores_all_state(abort):
+    model = target_model("deepseek_v41")
+    prompts = [mx.array([[1, 2, 3, 4, 5, 6, 7]]), mx.array([[2, 3, 4, 5]])]
+    caches = [model.make_cache()[0] for _ in prompts]
+    expected = [model.make_cache()[0] for _ in prompts]
+    for prompt, actual, reference in zip(prompts, caches, expected):
+        model(prompt, cache=[actual])
+        model(prompt, cache=[reference])
+    batch = type(caches[0]).merge(caches)
+    block = mx.array([[8, 9, 10], [5, 6, 7]])
+    _, transaction = verify_forward(model, block, [batch])
+    if abort:
+        transaction.abort()
+    else:
+        transaction.commit([1, 3])
+    for i, count in enumerate([0, 0] if abort else [1, 3]):
+        for j in range(count):
+            model(block[i : i + 1, j : j + 1], cache=[expected[i]])
+        equal(batch.rows[i].state, expected[i].state, atol=1e-5, rtol=1e-5)
+        assert batch.rows[i].offset == expected[i].offset
+    assert not batch.is_speculating and not any(
+        row.is_speculating for row in batch.rows
+    )
+
+
 def test_native_hidden_state_contracts():
     ids = mx.array([[1, 2, 3]])
     target = target_model("mellum")
     hidden = target(ids, return_hidden=True).hidden_states[-1]
     equal(hidden, target.model(ids))
+    target = target_model("deepseek_v41")
+    hidden = target(ids, capture_layer_ids=[0]).hidden_states[0]
+    # V4.1 taps precede the block; the first tap is the token embedding.
+    equal(hidden, target.embed_tokens(ids))
 
 
-@pytest.mark.parametrize("family", ["mellum"])
+@pytest.mark.parametrize("family", ["mellum", "deepseek_v41"])
 def test_native_split_load_and_greedy_generation(family, tmp_path):
     mx.random.seed(7)
     target = target_model(family)
     raw = target.config.to_dict()
-    arch = module(f"speculative.drafters.{family}_mtp")
-    draft = arch.Model(arch.ModelConfig(text_config=raw))
+    arch = module(
+        f"speculative.drafters.{family}_{'mtp' if family == 'mellum' else 'dspark'}"
+    )
+    opts = {} if family == "mellum" else dict(n_mtp_layers=2, markov_rank=8)
+    draft = arch.Model(arch.ModelConfig(text_config=raw, **opts))
     source = {}
     for key, value in tree_flatten(draft.parameters()):
-        key = f"mtp.{key}"
+        if family == "mellum":
+            key = f"mtp.{key}"
+        elif key.startswith("markov_head."):
+            key = f"mtp.1.{key.replace('markov_w1', 'embed').replace('markov_w2', 'head')}"
+        else:
+            key = key.replace("stages.", "mtp.", 1)
         if ".switch_mlp." in key:
             for index, tensor in enumerate(value):
                 stem = key.replace(".switch_mlp.", f".experts.{index}.")
+                if family == "deepseek_v41":
+                    stem = (
+                        stem.replace("gate_proj", "w1")
+                        .replace("down_proj", "w2")
+                        .replace("up_proj", "w3")
+                    )
                 source[stem] = tensor
+        elif ".attn.wo_a.weight" in key:
+            source[key] = value.flatten(0, 1)
         else:
             source[key] = value
     config, weights, path = split_checkpoint(tmp_path, raw, source, separate=True)
     loaded, kind = load_drafter(str(path))
     bundled, bundled_kind = load_drafter(str(tmp_path))
-    assert kind == bundled_kind == "mtp"
+    assert kind == bundled_kind == ("mtp" if family == "mellum" else "dflash")
     equal(
         dict(tree_flatten(loaded.parameters())),
         dict(tree_flatten(bundled.parameters())),
@@ -286,3 +353,28 @@ def test_qwen_text_aliases_share_native_splitter(name):
         source_config={"model_type": name, "mtp_num_hidden_layers": 1}
     )
     assert splitter.output_model_type == "qwen3_5_mtp"
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_deepseek_v41_native_packed_weights(bits):
+    split = get_mtp_splitter("deepseek_v41")
+    raw = target_model("deepseek_v41").config.to_dict()
+    mode = f"mxfp{bits}"
+    original = mx.random.normal((32, 32))
+    packed, scales = mx.quantize(original, group_size=32, bits=bits, mode=mode)
+    prefix = "mtp.0.main_proj" if bits == 8 else "mtp.0.ffn.experts.0.w1"
+    source = {f"{prefix}.weight": packed.view(mx.uint8), f"{prefix}.scale": scales}
+    if bits == 4:
+        source.update(
+            {k.replace("experts.0", "experts.1"): v for k, v in list(source.items())}
+        )
+    converted = split.transform(source, raw, False)
+    name = "stages.0.main_proj" if bits == 8 else "stages.0.ffn.switch_mlp.gate_proj"
+    weight, scale = converted[f"{name}.weight"], converted[f"{name}.scales"]
+    if bits == 4:
+        weight, scale = weight[0], scale[0]
+    equal(
+        mx.dequantize(weight, scale, group_size=32, bits=bits, mode=mode),
+        mx.dequantize(packed, scales, group_size=32, bits=bits, mode=mode),
+    )
+    assert split.quantization_from_source(converted, {})[name]["mode"] == mode
