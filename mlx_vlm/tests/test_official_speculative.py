@@ -7,13 +7,17 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
 
+from mlx_vlm.generate import generate_step
+from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import make_prompt_cache
 from mlx_vlm.speculative.common import verify_forward
+from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.speculative.drafters.compatibility import validate_dflash_target
 from mlx_vlm.speculative.drafters.dspark import Model as DSpark
 from mlx_vlm.speculative.drafters.dspark import ModelConfig as DSparkConfig
+from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
 from mlx_vlm.tests.test_models import model_case
-from mlx_vlm.tests.test_speculative import equal, module
+from mlx_vlm.tests.test_speculative import equal, module, split_checkpoint
 from mlx_vlm.utils import get_model_type
 
 
@@ -159,6 +163,22 @@ def target_model(family):
             ),
         )
         cfg = module(f"models.{family}.config").TextConfig.from_dict(basic)
+    elif family == "mellum":
+        basic.update(
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            head_dim=8,
+            norm_topk_prob=True,
+            sliding_window=4,
+            layer_types=["sliding_attention"] * 3 + ["full_attention"],
+            rope_parameters={
+                kind: {"rope_theta": 10000.0}
+                for kind in ("sliding_attention", "full_attention")
+            },
+            num_nextn_predict_layers=1,
+        )
+        cfg = module(f"models.{family}.config").ModelConfig.from_dict(basic)
     else:
         cfg = module(f"models.{family}.config").ModelConfig.from_dict(basic)
     model = module(f"models.{family}.language").LanguageModel(cfg)
@@ -205,3 +225,64 @@ def test_target_hidden_capture_and_rejected_prefix(family, keep):
         atol=1e-4,
         rtol=1e-4,
     )
+
+
+def test_native_hidden_state_contracts():
+    ids = mx.array([[1, 2, 3]])
+    target = target_model("mellum")
+    hidden = target(ids, return_hidden=True).hidden_states[-1]
+    equal(hidden, target.model(ids))
+
+
+@pytest.mark.parametrize("family", ["mellum"])
+def test_native_split_load_and_greedy_generation(family, tmp_path):
+    mx.random.seed(7)
+    target = target_model(family)
+    raw = target.config.to_dict()
+    arch = module(f"speculative.drafters.{family}_mtp")
+    draft = arch.Model(arch.ModelConfig(text_config=raw))
+    source = {}
+    for key, value in tree_flatten(draft.parameters()):
+        key = f"mtp.{key}"
+        if ".switch_mlp." in key:
+            for index, tensor in enumerate(value):
+                stem = key.replace(".switch_mlp.", f".experts.{index}.")
+                source[stem] = tensor
+        else:
+            source[key] = value
+    config, weights, path = split_checkpoint(tmp_path, raw, source, separate=True)
+    loaded, kind = load_drafter(str(path))
+    bundled, bundled_kind = load_drafter(str(tmp_path))
+    assert kind == bundled_kind == "mtp"
+    equal(
+        dict(tree_flatten(loaded.parameters())),
+        dict(tree_flatten(bundled.parameters())),
+    )
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+    embedding = getattr(target, "model", target).embed_tokens
+    outer = SimpleNamespace(
+        language_model=target,
+        config=target.config,
+        get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=embedding(ids)
+        ),
+    )
+
+    def run(**kwargs):
+        return [
+            int(token)
+            for token, _ in generate_step(
+                ids, outer, None, None, max_tokens=8, temperature=0, **kwargs
+            )
+        ]
+
+    assert run() == run(draft_model=loaded, draft_kind=kind, num_draft_tokens=3)
+    assert loaded.draft_lens
+
+
+@pytest.mark.parametrize("name", ["qwen3_5_text", "qwen3_5_moe_text"])
+def test_qwen_text_aliases_share_native_splitter(name):
+    splitter = get_mtp_splitter(
+        source_config={"model_type": name, "mtp_num_hidden_layers": 1}
+    )
+    assert splitter.output_model_type == "qwen3_5_mtp"

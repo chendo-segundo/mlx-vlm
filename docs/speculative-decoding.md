@@ -156,12 +156,17 @@ fits in local memory; large targets can be converted and quantized separately.
 | --- | --- |
 | Red Hat `speculators_model_type: dspark` | Nested backbone config, auxiliary hidden-state taps, causal sliding layers, optional reduced vocabulary and serialized output head |
 | OpenBMB `MiniCPM5-2B-DSpark` | Flat `Qwen3DSparkModel` config and Llama target hidden-state capture |
+| JetBrains `Mellum2.1-12B-A2.5B-Thinking-MTP` | Native `mtp.*` extraction, ordinary RMSNorm weights, post-normalization target features and a sliding-attention prediction layer |
+| Qwen `qwen3_5_text` / `qwen3_5_moe_text` | Native Qwen MTP extraction, including text-only Qwen3.8 checkpoints |
 
 The Red Hat format covers the published DSpark checkpoints for Qwen3-4B,
 Qwen3.6-35B-A3B, Qwen3.8-27B, Gemma-4-31B-it, Mistral-Small-4-119B-2603,
 GLM-5.2, GLM-5.3, GLM-5.3-Flash, Kimi-K3 and
 NVIDIA-Nemotron-3.5-Super-VL-120B-A12B. Reduced-vocabulary drafters map each
 sample back to a target token before using it in the next Markov step.
+
+Checkpoint metadata alone is insufficient: Qwen3-Coder-Next does not publish
+MTP tensors. A native head cannot be extracted from that checkpoint.
 
 Kimi K3 records both its convolution and recurrent state during verification.
 Records are retained only for the active block, prioritizing correct rollback
